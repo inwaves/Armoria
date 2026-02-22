@@ -1,11 +1,12 @@
 <script lang="ts">
   // @ts-check
-  import {createEventDispatcher, onMount} from "svelte";
+  import {createEventDispatcher, onMount, tick} from "svelte";
   import {generate} from "scripts/generator";
   import {PREFERENCE_API_URL} from "config/preference";
   import {shield} from "data/stores";
   import {shields} from "data/dataModel";
   import {rw} from "scripts/utils";
+  import {captureCoaBatch} from "scripts/svgCapture";
   import COA from "../object/COA.svelte";
   import type {Coa} from "types/coa";
 
@@ -14,6 +15,7 @@
   const dispatch = createEventDispatcher();
   const CANDIDATE_POOL = 40;
   const COA_SIZE = 260;
+  const CAPTURE_SIZE = 224;
 
   let pair: Coa[] = [];
   let comparisons = 0;
@@ -74,17 +76,30 @@
     loading = false;
   }
 
+  async function capturePairImages() {
+    await tick();
+    return captureCoaBatch(["pair-0", "pair-1"], CAPTURE_SIZE, 2);
+  }
+
   async function choose(index: number) {
     if (loading || pair.length < 2) return;
     loading = true;
     const winner = pair[index];
     const loser = pair[index === 0 ? 1 : 0];
+    const [imageA, imageB] = await capturePairImages();
+    const winnerImage = index === 0 ? imageA : imageB;
+    const loserImage = index === 0 ? imageB : imageA;
 
     try {
       const response = await fetch(`${PREFERENCE_API_URL}/api/preferences/pairwise`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({winner, loser})
+        body: JSON.stringify({
+          winner,
+          loser,
+          winner_image: winnerImage ?? undefined,
+          loser_image: loserImage ?? undefined
+        })
       });
       if (!response.ok) throw new Error("Failed to submit pairwise preference");
       dispatch("update");

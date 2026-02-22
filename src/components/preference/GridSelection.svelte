@@ -1,17 +1,20 @@
 <script lang="ts">
   // @ts-check
-  import {createEventDispatcher, onMount} from "svelte";
+  import {createEventDispatcher, onMount, tick} from "svelte";
   import {generate} from "scripts/generator";
   import {PREFERENCE_API_URL} from "config/preference";
   import {shield} from "data/stores";
   import {shields} from "data/dataModel";
   import {rw} from "scripts/utils";
+  import {captureCoaBatch} from "scripts/svgCapture";
   import COA from "../object/COA.svelte";
   import type {Coa} from "types/coa";
 
   const dispatch = createEventDispatcher();
   const GRID_SIZE = 20;
   const COA_SIZE = 140;
+  const CAPTURE_SIZE = 224;
+  const CAPTURE_BATCH = 10;
 
   let round = 1;
   let coas: Coa[] = [];
@@ -41,13 +44,21 @@
     selections = selections.slice();
   }
 
+  async function captureGridImages() {
+    await tick();
+    const ids = coas.map((_, index) => `grid-${index}`);
+    return captureCoaBatch(ids, CAPTURE_SIZE, CAPTURE_BATCH);
+  }
+
   async function submitRound() {
     if (submitting) return;
     submitting = true;
+    const images = await captureGridImages();
     const payload = {
       selections: coas.map((coa, index) => ({
         coa,
-        selected: selections[index]
+        selected: selections[index],
+        image: images[index] ?? undefined
       }))
     };
 

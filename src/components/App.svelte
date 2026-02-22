@@ -185,7 +185,7 @@
 
 <style>
   div {
-    height: 100%;
+    min-height: 100%;
     width: 100%;
     background-image: url(../background.svg);
   }

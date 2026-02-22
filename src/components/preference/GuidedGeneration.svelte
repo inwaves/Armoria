@@ -1,11 +1,12 @@
 <script lang="ts">
   // @ts-check
-  import {createEventDispatcher} from "svelte";
+  import {createEventDispatcher, tick} from "svelte";
   import {generate} from "scripts/generator";
   import {PREFERENCE_API_URL} from "config/preference";
   import {shield} from "data/stores";
   import {shields} from "data/dataModel";
   import {rw} from "scripts/utils";
+  import {captureCoaBatch} from "scripts/svgCapture";
   import COA from "../object/COA.svelte";
   import type {Coa} from "types/coa";
 
@@ -16,8 +17,11 @@
   const TOP_K = 20;
   const COA_SIZE = 140;
   const FEEDBACK_SIZE = 220;
+  const CAPTURE_SIZE = 224;
+  const CAPTURE_BATCH = 25;
 
   let scored: ScoredCoa[] = [];
+  let captureCandidates: Coa[] = [];
   let loading = false;
   let selectedIndex: number | null = null;
   let feedbackActive = false;
@@ -34,14 +38,34 @@
 
     $shield = rw(shields[rw(shields.types)]);
 
-    const candidates = Array.from(seeds, seed => generate(seed % 1000000000));
+    const generated = Array.from(seeds, seed => generate(seed % 1000000000));
     Math.random = savedRandom;
+
+    let capturedImages: Array<string | null> = [];
+    try {
+      captureCandidates = generated;
+      await tick();
+      const ids = generated.map((_, index) => `guided-candidate-${index}`);
+      capturedImages = await captureCoaBatch(ids, CAPTURE_SIZE, CAPTURE_BATCH);
+    } catch (error) {
+      console.error(error);
+    } finally {
+      captureCandidates = [];
+    }
+
+    const validImages = capturedImages.filter(
+      (image): image is string => typeof image === "string"
+    );
+    const payload =
+      validImages.length === generated.length
+        ? {coas: generated, images: validImages}
+        : {coas: generated};
 
     try {
       const response = await fetch(`${PREFERENCE_API_URL}/api/score`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({coas: candidates})
+        body: JSON.stringify(payload)
       });
 
       let scores: number[] = [];
@@ -50,7 +74,7 @@
         if (Array.isArray(data.scores)) scores = data.scores;
       }
 
-      const scoredAll = candidates.map((coa, index) => ({
+      const scoredAll = generated.map((coa, index) => ({
         coa,
         score: typeof scores[index] === "number" ? scores[index] : 0.5
       }));
@@ -58,7 +82,7 @@
       scored = scoredAll.slice(0, TOP_K);
     } catch (error) {
       console.error(error);
-      scored = candidates.slice(0, TOP_K).map(coa => ({coa, score: 0.5}));
+      scored = generated.slice(0, TOP_K).map(coa => ({coa, score: 0.5}));
     }
 
     loading = false;
@@ -96,12 +120,25 @@
     feedbackSubmitting = true;
     const winner = feedbackPair[index].coa;
     const loser = feedbackPair[index === 0 ? 1 : 0].coa;
+    await tick();
+    const [imageA, imageB] = await captureCoaBatch(
+      ["feedback-0", "feedback-1"],
+      CAPTURE_SIZE,
+      2
+    );
+    const winnerImage = index === 0 ? imageA : imageB;
+    const loserImage = index === 0 ? imageB : imageA;
 
     try {
       const response = await fetch(`${PREFERENCE_API_URL}/api/preferences/pairwise`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({winner, loser})
+        body: JSON.stringify({
+          winner,
+          loser,
+          winner_image: winnerImage ?? undefined,
+          loser_image: loserImage ?? undefined
+        })
       });
       if (!response.ok) throw new Error("Failed to submit feedback");
       dispatch("update");
@@ -174,6 +211,12 @@
       {/if}
     </section>
   {/if}
+
+  <div class="capture-bank" aria-hidden="true">
+    {#each captureCandidates as coa, i}
+      <COA coa={coa} i={`guided-candidate-${i}`} width={CAPTURE_SIZE} height={CAPTURE_SIZE} />
+    {/each}
+  </div>
 </main>
 
 <style>
@@ -339,5 +382,13 @@
   button:disabled {
     opacity: 0.6;
     cursor: default;
+  }
+
+  .capture-bank {
+    position: absolute;
+    left: -10000px;
+    top: -10000px;
+    opacity: 0;
+    pointer-events: none;
   }
 </style>

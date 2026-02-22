@@ -1,45 +1,81 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from joblib import dump, load
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 
-from .features import extract_features, get_feature_names
+EmbeddingLike = Union[List[float], np.ndarray]
 
 
 class PreferenceModel:
     """Pairwise preference model based on a gradient boosted classifier."""
 
-    def __init__(self) -> None:
+    def __init__(self, embedding_dim: int = 512) -> None:
+        self.embedding_dim = embedding_dim
         self.model: Optional[GradientBoostingClassifier] = None
         self.scaler = StandardScaler()
         self.is_trained = False
-        self.feature_names = get_feature_names()
-        self.reference_features = np.zeros(len(self.feature_names), dtype=float)
+        self.reference_embedding = np.zeros(self.embedding_dim, dtype=float)
 
-    def _build_pairs(self, preferences: List[dict]) -> List[Tuple[dict, dict]]:
-        pairwise: List[Tuple[dict, dict]] = []
-        selected: List[dict] = []
-        rejected: List[dict] = []
+    def _to_embedding(self, embedding: Optional[EmbeddingLike]) -> Optional[np.ndarray]:
+        if embedding is None:
+            return None
+        array = np.array(embedding, dtype=float).reshape(-1)
+        if array.shape[0] != self.embedding_dim:
+            return None
+        return array
+
+    def _extract_pair_embeddings(
+        self, pref: dict
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        winner_embedding = pref.get("winner_embedding")
+        if winner_embedding is None:
+            winner = pref.get("winner")
+            if isinstance(winner, dict):
+                winner_embedding = winner.get("embedding")
+
+        loser_embedding = pref.get("loser_embedding")
+        if loser_embedding is None:
+            loser = pref.get("loser")
+            if isinstance(loser, dict):
+                loser_embedding = loser.get("embedding")
+
+        winner_array = self._to_embedding(winner_embedding)
+        loser_array = self._to_embedding(loser_embedding)
+        if winner_array is None or loser_array is None:
+            return None
+        return winner_array, loser_array
+
+    def _extract_grid_embedding(self, pref: dict) -> Optional[np.ndarray]:
+        embedding = pref.get("embedding")
+        if embedding is None:
+            coa = pref.get("coa")
+            if isinstance(coa, dict):
+                embedding = coa.get("embedding")
+        return self._to_embedding(embedding)
+
+    def _build_pairs(self, preferences: List[dict]) -> List[Tuple[np.ndarray, np.ndarray]]:
+        pairwise: List[Tuple[np.ndarray, np.ndarray]] = []
+        selected: List[np.ndarray] = []
+        rejected: List[np.ndarray] = []
 
         for pref in preferences:
             pref_type = pref.get("type")
             if pref_type == "pairwise":
-                winner = pref.get("winner")
-                loser = pref.get("loser")
-                if winner and loser:
-                    pairwise.append((winner, loser))
+                pair = self._extract_pair_embeddings(pref)
+                if pair:
+                    pairwise.append(pair)
             elif pref_type == "grid":
-                coa = pref.get("coa")
-                if not coa:
+                embedding = self._extract_grid_embedding(pref)
+                if embedding is None:
                     continue
                 if pref.get("selected"):
-                    selected.append(coa)
+                    selected.append(embedding)
                 else:
-                    rejected.append(coa)
+                    rejected.append(embedding)
 
         if selected and rejected:
             for winner in selected:
@@ -49,21 +85,22 @@ class PreferenceModel:
         return pairwise
 
     def _compute_reference(self, preferences: List[dict]) -> np.ndarray:
-        all_features: List[List[float]] = []
+        embeddings: List[np.ndarray] = []
         for pref in preferences:
             pref_type = pref.get("type")
             if pref_type == "pairwise":
-                if pref.get("winner"):
-                    all_features.append(extract_features(pref["winner"]))
-                if pref.get("loser"):
-                    all_features.append(extract_features(pref["loser"]))
-            elif pref_type == "grid" and pref.get("coa"):
-                all_features.append(extract_features(pref["coa"]))
+                pair = self._extract_pair_embeddings(pref)
+                if pair:
+                    embeddings.extend(pair)
+            elif pref_type == "grid":
+                embedding = self._extract_grid_embedding(pref)
+                if embedding is not None:
+                    embeddings.append(embedding)
 
-        if not all_features:
-            return np.zeros(len(self.feature_names), dtype=float)
+        if not embeddings:
+            return np.zeros(self.embedding_dim, dtype=float)
 
-        return np.mean(np.array(all_features, dtype=float), axis=0)
+        return np.mean(np.stack(embeddings, axis=0), axis=0)
 
     def fit(self, preferences: List[dict]) -> Dict[str, float]:
         """Train the model from collected preferences."""
@@ -76,10 +113,8 @@ class PreferenceModel:
         X: List[np.ndarray] = []
         y: List[int] = []
 
-        for winner, loser in pairs:
-            winner_features = np.array(extract_features(winner), dtype=float)
-            loser_features = np.array(extract_features(loser), dtype=float)
-            diff = winner_features - loser_features
+        for winner_embedding, loser_embedding in pairs:
+            diff = winner_embedding - loser_embedding
 
             X.append(diff)
             y.append(1)
@@ -97,32 +132,38 @@ class PreferenceModel:
         self.is_trained = True
 
         accuracy = float(self.model.score(X_scaled, y_array))
-        self.reference_features = self._compute_reference(preferences)
+        self.reference_embedding = self._compute_reference(preferences)
 
         return {"accuracy": accuracy, "n_samples": int(len(y_array))}
 
-    def score(self, coa: dict) -> float:
-        """Return a preference score in [0, 1] for a single COA."""
+    def score(self, embedding: EmbeddingLike) -> float:
+        """Return a preference score in [0, 1] for a single embedding."""
         if not self.model or not self.is_trained:
             return 0.5
 
-        features = np.array(extract_features(coa), dtype=float)
-        diff = features - self.reference_features
+        vector = self._to_embedding(embedding)
+        if vector is None:
+            return 0.5
+
+        diff = vector - self.reference_embedding
         X_scaled = self.scaler.transform([diff])
         return float(self.model.predict_proba(X_scaled)[0][1])
 
-    def score_batch(self, coas: List[dict]) -> List[float]:
-        """Score a batch of COAs."""
-        return [self.score(coa) for coa in coas]
+    def score_batch(self, embeddings: List[EmbeddingLike]) -> List[float]:
+        """Score a batch of embeddings."""
+        return [self.score(embedding) for embedding in embeddings]
 
-    def get_uncertainty(self, coa1: dict, coa2: dict) -> float:
-        """Return uncertainty for the comparison between two COAs."""
+    def get_uncertainty(self, embedding1: EmbeddingLike, embedding2: EmbeddingLike) -> float:
+        """Return uncertainty for the comparison between two embeddings."""
         if not self.model or not self.is_trained:
             return 0.5
 
-        features1 = np.array(extract_features(coa1), dtype=float)
-        features2 = np.array(extract_features(coa2), dtype=float)
-        diff = features1 - features2
+        vector1 = self._to_embedding(embedding1)
+        vector2 = self._to_embedding(embedding2)
+        if vector1 is None or vector2 is None:
+            return 0.5
+
+        diff = vector1 - vector2
         X_scaled = self.scaler.transform([diff])
         proba = float(self.model.predict_proba(X_scaled)[0][1])
         return float(1.0 - abs(proba - 0.5) * 2.0)
@@ -134,8 +175,8 @@ class PreferenceModel:
                 "model": self.model,
                 "scaler": self.scaler,
                 "is_trained": self.is_trained,
-                "feature_names": self.feature_names,
-                "reference_features": self.reference_features,
+                "embedding_dim": self.embedding_dim,
+                "reference_embedding": self.reference_embedding,
             },
             path,
         )
@@ -146,15 +187,24 @@ class PreferenceModel:
         self.model = data.get("model")
         self.scaler = data.get("scaler", StandardScaler())
         self.is_trained = data.get("is_trained", False)
-        self.feature_names = data.get("feature_names", get_feature_names())
-        self.reference_features = data.get(
-            "reference_features", np.zeros(len(self.feature_names), dtype=float)
-        )
+        self.embedding_dim = data.get("embedding_dim", self.embedding_dim)
+        reference = data.get("reference_embedding")
+        if reference is not None:
+            reference_array = np.array(reference, dtype=float).reshape(-1)
+            if reference_array.shape[0] == self.embedding_dim:
+                self.reference_embedding = reference_array
+            else:
+                self.reference_embedding = np.zeros(self.embedding_dim, dtype=float)
+        else:
+            self.reference_embedding = np.zeros(self.embedding_dim, dtype=float)
 
     def get_feature_importance(self) -> Dict[str, float]:
-        """Return feature importance weights."""
+        """Return embedding importance weights."""
         if not self.model or not self.is_trained:
             return {}
 
         importances = self.model.feature_importances_
-        return {name: float(value) for name, value in zip(self.feature_names, importances)}
+        return {
+            f"embedding_{idx}": float(value)
+            for idx, value in enumerate(importances)
+        }

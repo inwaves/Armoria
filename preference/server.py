@@ -5,18 +5,24 @@ import os
 import random
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .clip_embedder import CLIPEmbedder
+from .features import extract_features, get_feature_names
 from .model import PreferenceModel
 
 DATA_PATH = Path(__file__).resolve().parent / "preference_data.json"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "public"
 data_lock = Lock()
+
+clip_embedder = CLIPEmbedder()
+FEATURE_DIM = len(get_feature_names())
 
 app = FastAPI(title="Armoria Preference API")
 
@@ -38,6 +44,7 @@ app.add_middleware(
 class GridSelection(BaseModel):
     coa: Dict[str, Any]
     selected: bool
+    image: Optional[str] = None
 
 
 class GridPreferenceRequest(BaseModel):
@@ -47,10 +54,13 @@ class GridPreferenceRequest(BaseModel):
 class PairwisePreferenceRequest(BaseModel):
     winner: Dict[str, Any]
     loser: Dict[str, Any]
+    winner_image: Optional[str] = None
+    loser_image: Optional[str] = None
 
 
 class ScoreRequest(BaseModel):
     coas: List[Dict[str, Any]]
+    images: Optional[List[str]] = None
 
 
 class SuggestPairRequest(BaseModel):
@@ -76,17 +86,111 @@ def save_preferences(preferences: List[Dict[str, Any]]) -> None:
             json.dump({"preferences": preferences}, handle, ensure_ascii=False, indent=2)
 
 
+def _is_valid_image(image: Optional[str]) -> bool:
+    return bool(image and image.strip())
+
+
+def _get_embedding_length(value: Any) -> Optional[int]:
+    if isinstance(value, np.ndarray):
+        return int(value.shape[0])
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return None
+
+
+def _pref_has_embedding_dim(pref: Dict[str, Any], dim: int) -> bool:
+    pref_type = pref.get("type")
+    if pref_type == "grid":
+        return _get_embedding_length(pref.get("embedding")) == dim
+    if pref_type == "pairwise":
+        return (
+            _get_embedding_length(pref.get("winner_embedding")) == dim
+            or _get_embedding_length(pref.get("loser_embedding")) == dim
+        )
+    return False
+
+
+def _select_embedding_dim(preferences: List[Dict[str, Any]]) -> int:
+    clip_dim = clip_embedder.embedding_dim
+    if any(_pref_has_embedding_dim(pref, clip_dim) for pref in preferences):
+        return clip_dim
+    if any(_pref_has_embedding_dim(pref, FEATURE_DIM) for pref in preferences):
+        return FEATURE_DIM
+    return clip_dim
+
+
+def _ensure_feature_embeddings(preferences: List[Dict[str, Any]]) -> bool:
+    updated = False
+    for pref in preferences:
+        pref_type = pref.get("type")
+        if pref_type == "grid":
+            if pref.get("embedding") is None and pref.get("coa"):
+                pref["embedding"] = extract_features(pref["coa"])
+                pref["embedding_type"] = "features"
+                updated = True
+        elif pref_type == "pairwise":
+            if pref.get("winner_embedding") is None and pref.get("winner"):
+                pref["winner_embedding"] = extract_features(pref["winner"])
+                pref["winner_embedding_type"] = "features"
+                updated = True
+            if pref.get("loser_embedding") is None and pref.get("loser"):
+                pref["loser_embedding"] = extract_features(pref["loser"])
+                pref["loser_embedding_type"] = "features"
+                updated = True
+    return updated
+
+
+def _embed_images_safe(images: List[str]) -> Optional[np.ndarray]:
+    if not images:
+        return None
+    try:
+        return clip_embedder.embed_base64_batch(images)
+    except Exception as exc:  # pragma: no cover - best effort fallback
+        print(f"CLIP embedding failed: {exc}")
+        return None
+
+
 preferences: List[Dict[str, Any]] = load_preferences()
-model = PreferenceModel()
+model = PreferenceModel(embedding_dim=clip_embedder.embedding_dim)
 model_stats: Dict[str, Any] = {"accuracy": 0.0, "n_samples": 0}
 
 
 @app.post("/api/preferences/grid")
 def add_grid_preferences(payload: GridPreferenceRequest) -> Dict[str, Any]:
-    new_items = [
-        {"type": "grid", "coa": selection.coa, "selected": selection.selected}
-        for selection in payload.selections
+    selections = payload.selections
+    image_indices = [
+        index
+        for index, selection in enumerate(selections)
+        if _is_valid_image(selection.image)
     ]
+    clip_embeddings = None
+    if image_indices:
+        clip_images = [selections[index].image for index in image_indices]
+        clip_embeddings = _embed_images_safe(clip_images)
+
+    clip_map: Dict[int, List[float]] = {}
+    if clip_embeddings is not None:
+        for index, embedding in zip(image_indices, clip_embeddings):
+            clip_map[index] = embedding.tolist()
+
+    new_items = []
+    for index, selection in enumerate(selections):
+        if index in clip_map:
+            embedding = clip_map[index]
+            embedding_type = "clip"
+        else:
+            embedding = extract_features(selection.coa)
+            embedding_type = "features"
+        new_items.append(
+            {
+                "type": "grid",
+                "coa": selection.coa,
+                "selected": selection.selected,
+                "embedding": embedding,
+                "embedding_type": embedding_type,
+            }
+        )
+
     preferences.extend(new_items)
     save_preferences(preferences)
     return {"saved": len(new_items), "total": len(preferences)}
@@ -94,8 +198,37 @@ def add_grid_preferences(payload: GridPreferenceRequest) -> Dict[str, Any]:
 
 @app.post("/api/preferences/pairwise")
 def add_pairwise_preferences(payload: PairwisePreferenceRequest) -> Dict[str, Any]:
+    use_clip = _is_valid_image(payload.winner_image) and _is_valid_image(
+        payload.loser_image
+    )
+    winner_embedding: List[float]
+    loser_embedding: List[float]
+    embedding_type = "features"
+
+    if use_clip:
+        clip_embeddings = _embed_images_safe(
+            [payload.winner_image, payload.loser_image]
+        )
+        if clip_embeddings is not None:
+            winner_embedding = clip_embeddings[0].tolist()
+            loser_embedding = clip_embeddings[1].tolist()
+            embedding_type = "clip"
+        else:
+            winner_embedding = extract_features(payload.winner)
+            loser_embedding = extract_features(payload.loser)
+    else:
+        winner_embedding = extract_features(payload.winner)
+        loser_embedding = extract_features(payload.loser)
+
     preferences.append(
-        {"type": "pairwise", "winner": payload.winner, "loser": payload.loser}
+        {
+            "type": "pairwise",
+            "winner": payload.winner,
+            "loser": payload.loser,
+            "winner_embedding": winner_embedding,
+            "loser_embedding": loser_embedding,
+            "embedding_type": embedding_type,
+        }
     )
     save_preferences(preferences)
     return {"saved": 1, "total": len(preferences)}
@@ -103,30 +236,52 @@ def add_pairwise_preferences(payload: PairwisePreferenceRequest) -> Dict[str, An
 
 @app.post("/api/train")
 def train_model() -> Dict[str, Any]:
-    global model_stats
+    global model, model_stats
+    embedding_dim = _select_embedding_dim(preferences)
+    if model.embedding_dim != embedding_dim:
+        model = PreferenceModel(embedding_dim=embedding_dim)
+
+    if embedding_dim == FEATURE_DIM:
+        if _ensure_feature_embeddings(preferences):
+            save_preferences(preferences)
+
     model_stats = model.fit(preferences)
     return {"trained": model.is_trained, **model_stats}
 
 
 @app.post("/api/score")
 def score_coas(payload: ScoreRequest) -> Dict[str, Any]:
-    scores = model.score_batch(payload.coas)
+    images = payload.images
+    if images is not None and len(images) != len(payload.coas):
+        raise HTTPException(
+            status_code=400, detail="Images length must match COAs length"
+        )
+
+    use_images = images is not None and all(_is_valid_image(img) for img in images)
+    embeddings: List[List[float]] | np.ndarray
+
+    if use_images:
+        clip_embeddings = _embed_images_safe(images)
+        if clip_embeddings is not None:
+            embeddings = clip_embeddings
+        else:
+            embeddings = [extract_features(coa) for coa in payload.coas]
+    else:
+        embeddings = [extract_features(coa) for coa in payload.coas]
+
+    scores = model.score_batch(embeddings)
     return {"scores": scores, "trained": model.is_trained}
 
 
 @app.post("/api/suggest-pair")
 def suggest_pair(payload: SuggestPairRequest) -> Dict[str, Any]:
-    from .features import extract_features
-    import numpy as np
-
     candidates = payload.candidates
     if len(candidates) < 2:
         raise HTTPException(status_code=400, detail="At least two candidates required")
 
-    if model.is_trained:
-        # Pre-compute features for all candidates
-        features = [np.array(extract_features(c), dtype=float) for c in candidates]
+    features = [np.array(extract_features(c), dtype=float) for c in candidates]
 
+    if model.is_trained:
         # Minimum L1 feature distance to consider a pair "distinct enough"
         MIN_DISTANCE = 3.0
 
@@ -151,7 +306,7 @@ def suggest_pair(payload: SuggestPairRequest) -> Dict[str, Any]:
                 if distance < MIN_DISTANCE:
                     continue
 
-                uncertainty = model.get_uncertainty(candidates[i], candidates[j])
+                uncertainty = model.get_uncertainty(features[i], features[j])
                 # Combined score: uncertainty weighted by diversity
                 combined = uncertainty * (1.0 + distance)
                 if combined > best_score:
@@ -164,7 +319,8 @@ def suggest_pair(payload: SuggestPairRequest) -> Dict[str, Any]:
             if max_distance_pair is not None:
                 best_pair = max_distance_pair
                 best_uncertainty = model.get_uncertainty(
-                    max_distance_pair[0], max_distance_pair[1]
+                    features[candidates.index(max_distance_pair[0])],
+                    features[candidates.index(max_distance_pair[1])],
                 )
             else:
                 best_pair = tuple(random.sample(candidates, 2))
@@ -208,7 +364,7 @@ def reset_preferences() -> Dict[str, Any]:
     global model, model_stats
     preferences.clear()
     save_preferences(preferences)
-    model = PreferenceModel()
+    model = PreferenceModel(embedding_dim=clip_embedder.embedding_dim)
     model_stats = {"accuracy": 0.0, "n_samples": 0}
     return {"status": "reset", "total": len(preferences)}
 
